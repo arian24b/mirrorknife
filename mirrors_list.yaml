@@ -1,0 +1,317 @@
+# mirrors_list.yaml
+# Curated Iranian mirrors (Linux repos + PyPI/npm + Docker registries) for health-check tooling.
+# Notes:
+# - Some entries are "portal/docs" pages (not a direct repo root). Keep them if you want them listed, but your checker may mark them failed.
+# - Use `packages:` mainly as tags; your script can decide what paths/tests to run per package type.
+
+mirrors:
+  # --- Mirava core list (geedook.github.io/mirava) ---
+  - name: Iranrepo
+    url: https://iranrepo.ir/
+    description: Local mirror providing Debian/Ubuntu/Arch/PyPI.
+    packages:
+      - Debian
+      - Ubuntu
+      - Arch Linux
+      - PyPI
+
+  - name: KubarCloud
+    url: https://mirrors.kubarcloud.com/
+    description: Public software mirror hosted by Kubar Cloud (wide coverage).
+    packages:
+      - Alpine
+      - Arch Linux
+      - CentOS
+      - Debian
+      - Ubuntu
+      - PyPI
+      - npm
+
+  - name: Shatel (mirror.shatel.ir)
+    url: https://mirror.shatel.ir/
+    description: Shatel mirror server (Ubuntu/Debian/Kali trees + rsync examples on site).
+    packages:
+      - Ubuntu
+      - Debian
+      - Kali Linux
+
+  - name: ITO Portal
+    url: https://repo-portal.ito.gov.ir/
+    description: Government-backed repository portal (landing/portal).
+    packages:
+      - Debian
+      - Ubuntu
+      - PyPI
+      - npm
+      - Docker Registry
+
+  - name: ITO Archive
+    url: https://archive.ito.gov.ir/
+    description: ITO archive host (direct repo roots like /debian/).
+    packages:
+      - Debian
+      - Ubuntu
+      - CentOS
+      - Fedora
+      - Rocky Linux
+      - PyPI
+      - npm
+
+  - name: Jamko
+    url: https://www.jamko.ir/
+    description: Docs + configs for mirrors across ecosystems (endpoints may vary).
+    packages:
+      - Debian
+      - Ubuntu
+      - RPM
+      - PyPI
+      - npm
+      - Yarn
+      - Composer
+      - Maven
+      - Gradle
+
+  - name: Runflare (docs)
+    url: https://runflare.com/mirrors/
+    description: Runflare mirrors documentation hub (multiple ecosystems).
+    packages:
+      - PyPI
+      - npm
+      - Node.js
+      - Composer
+
+  - name: Runflare PyPI (direct)
+    url: https://mirror-pypi.runflare.com/
+    description: Runflare PyPI mirror host.
+    packages:
+      - PyPI
+
+  - name: EN Mirror
+    url: https://en-mirror.ir/
+    description: Gradle/Maven mirror for restricted networks.
+    packages:
+      - Maven Central
+      - Google Maven
+      - Jitpack Maven
+
+  # --- Universities / large mirror hubs ---
+  - name: IUT (Isfahan University of Technology)
+    url: https://repo.iut.ac.ir/
+    description: Broad university mirror (Debian/Ubuntu and many more).
+    packages:
+      - Debian
+      - Ubuntu
+      - Mint
+      - Arch Linux
+      - Manjaro
+      - Raspbian
+      - Alpine
+      - Rocky Linux
+      - Fedora
+      - OpenSUSE
+      - OpenBSD
+      - CTAN
+
+  - name: IranServer
+    url: https://mirror.iranserver.com/
+    description: IranServer mirror (Debian/Ubuntu/CentOS).
+    packages:
+      - Debian
+      - Ubuntu
+      - CentOS
+
+  - name: MobinHost Mirror
+    url: https://mirror.mobinhost.com/
+    description: MobinHost software mirror (multi-distro).
+    packages:
+      - Ubuntu
+      - Debian
+      - Alpine
+      - Arch Linux
+      - Fedora
+      - Fedora EPEL
+      - CentOS
+      - Almalinux
+      - FreeBSD
+      - Manjaro
+      - MariaDB
+      - MongoDB
+      - Raspbian
+      - Zabbix
+
+  - name: 0-1 Cloud
+    url: https://mirror.0-1.cloud/
+    description: Multi-distro mirror hub (includes Ubuntu/Debian/CentOS/etc).
+    packages:
+      - Ubuntu
+      - Debian
+      - CentOS
+      - Fedora EPEL
+      - Alpine
+      - Arch Linux
+      - Almalinux
+      - FreeBSD
+      - Windows
+
+  # --- Ubuntu-focused (your list + common IR Ubuntu hosts) ---
+  - name: Ubuntu (Iran) - ir.archive.ubuntu.com
+    url: http://ir.archive.ubuntu.com/ubuntu/
+    description: Ubuntu country alias (may point to a local IR mirror).
+    packages:
+      - Ubuntu
+
+  - name: ArvanCloud Ubuntu Mirror
+    url: https://mirror.arvancloud.ir/
+    description: ArvanCloud official Ubuntu mirror host.
+    packages:
+      - Ubuntu
+
+  - name: Sindad Ubuntu Mirror
+    url: https://ir.ubuntu.sindad.cloud/
+    description: Ubuntu mirror host (Sindad).
+    packages:
+      - Ubuntu
+
+  - name: PardisCo Ubuntu Mirror (mirrors.pardisco.co)
+    url: https://mirrors.pardisco.co/
+    description: PardisCo official Ubuntu mirror + broader ecosystem mirrors.
+    packages:
+      - Ubuntu
+      - Debian
+      - CentOS
+      - Alpine
+      - PyPI
+      - npm
+      - Docker Registry
+      - Go
+      - NuGet
+
+  - name: Ubuntu HostIran
+    url: https://ubuntu.hostiran.ir/
+    description: Ubuntu mirror (HostIran).
+    packages:
+      - Ubuntu
+
+  - name: Ubuntu Shatel (alias host)
+    url: https://ubuntu.shatel.ir/
+    description: Ubuntu-only alias host (if available in your env).
+    packages:
+      - Ubuntu
+
+  - name: Ubuntu Pars Host
+    url: https://ubuntu.pars.host/
+    description: Ubuntu mirror host.
+    packages:
+      - Ubuntu
+
+  - name: Archive Ubuntu Petiak
+    url: https://archive.ubuntu.petiak.ir/
+    description: Ubuntu mirror host.
+    packages:
+      - Ubuntu
+
+  - name: Repo LinuxMirrors
+    url: https://repo.linuxmirrors.ir/
+    description: Generic repo host (often used as distro mirror root).
+    packages:
+      - Ubuntu
+      - Debian
+      - CentOS
+
+  - name: ManageIT Ubuntu Mirror
+    url: https://mirror.manageit.ir/
+    description: Ubuntu mirror host.
+    packages:
+      - Ubuntu
+
+  - name: KimiaHost Ubuntu Mirror
+    url: https://ubuntu-mirror.kimiahost.com/
+    description: Ubuntu mirror host.
+    packages:
+      - Ubuntu
+
+  - name: DigitalVPS Ubuntu Mirror
+    url: https://mirror.digitalvps.ir/
+    description: Ubuntu mirror host.
+    packages:
+      - Ubuntu
+
+  # --- RPM/CentOS/RHEL-family ---
+  - name: Faraso (CentOS/EPEL)
+    url: https://mirror.faraso.org/
+    description: CentOS/EPEL-focused mirror (per your list).
+    packages:
+      - CentOS
+      - Fedora EPEL
+
+  - name: AminIDC Mirror Hub
+    url: https://mirror.aminidc.com/
+    description: Multi-OS mirror hub (includes RHEL-family).
+    packages:
+      - Ubuntu
+      - Debian
+      - Rocky Linux
+      - RHEL
+      - Almalinux
+      - Fedora EPEL
+      - Windows
+
+  - name: Afranet (site)
+    url: https://afranet.com/
+    description: Afranet mirror info/site (endpoint may vary).
+    packages:
+      - Ubuntu
+      - Debian
+      - CentOS
+
+  - name: Pishgaman (site)
+    url: https://pishgaman.net/
+    description: Pishgaman mirror info/site (endpoint may vary).
+    packages:
+      - Ubuntu
+
+  # --- Docker registries / mirrors ---
+  - name: HamDocker Registry
+    url: https://hub.hamdocker.ir/
+    description: Docker registry/mirror (sanctions-friendly).
+    packages:
+      - Docker Registry
+
+  - name: MobinHost Docker Registry
+    url: https://docker.mobinhost.com/
+    description: Docker registry/mirror.
+    packages:
+      - Docker Registry
+
+  - name: ArvanCloud Docker (docs)
+    url: https://www.arvancloud.ir/fa/dev/docker
+    description: ArvanCloud Docker mirror docs/portal (endpoint may vary).
+    packages:
+      - Docker Registry
+
+  - name: Focker Registry
+    url: https://focker.ir/
+    description: Docker registry mirror.
+    packages:
+      - Docker Registry
+
+  - name: Docker Kernel Mirror
+    url: https://docker.kernel.ir/
+    description: Docker registry mirror (provides daemon.json snippet).
+    packages:
+      - Docker Registry
+
+  # --- Android/Maven/Gradle extras (optional tags for your “swiss army knife”) ---
+  - name: Myket Maven
+    url: https://maven.myket.ir/
+    description: Android maven repositories (google/mavenCentral/jitpack).
+    packages:
+      - Maven Central
+      - Google Maven
+      - Jitpack Maven
+
+  - name: Terraform Proxy (Peaker)
+    url: https://terraform.peaker.info/
+    description: Terraform module/provider proxy.
+    packages:
+      - Terraform
