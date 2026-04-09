@@ -14,7 +14,8 @@ Works on **macOS**, **Ubuntu/Linux**, and **Raspberry Pi**.
   - TCP connect time to port 53
   - TCP DNS query time
   - Ping average latency (system ping)
-- Picks **best DNS** based on successful resolution + lowest UDP DNS time
+- Considers DNS **healthy** if UDP or TCP resolves successfully
+- Picks **best DNS** using a weighted score of UDP/TCP/Ping
 
 ### Mirrors tool
 Reads `mirrors_list.yaml` and checks (depending on `packages:` tags):
@@ -23,15 +24,22 @@ Reads `mirrors_list.yaml` and checks (depending on `packages:` tags):
 - **npm**: tries `/-/ping`, `/~/ping`, then `/`
 - **Ubuntu/Debian (APT)**: checks `dists/<suite>/Release` with smart subpath probing (`/`, `/ubuntu/`, `/debian/`)
 - **RHEL-family (DNF/YUM)**: checks `repodata/repomd.xml` using multiple common paths
+- **Maven/Gradle**: checks common repository roots
+- **Go modules**: probes module proxy paths
+- **NuGet**: checks `v3/index.json`
+- **Composer**: checks `packages.json`
 
 ### Docker tool
 - `ping`: check `/v2/`
 - `catalog`: list repositories from `/v2/_catalog` *(often disabled by registries)*
 - `tags`: list tags for a known repo via `/v2/<repo>/tags/list`
 
+### Init tool
+- `init`: generate sample `DNSs.txt` and `mirrors_list.yaml`
+
 ### TUI (optional)
 Interactive curses UI:
-- refresh, filter, export JSON, show best picks
+- refresh, filter, export JSON, show best picks, live refresh
 
 ---
 
@@ -114,10 +122,33 @@ mirrors:
 
 ## Usage (English)
 
+### Global options
+
+* `--quick` quick preset (lower timeout, fewer retries)
+* `--deep` deep preset (higher timeout, more retries)
+* `--retries N` number of attempts per target
+* `--only-best` skip table, print best picks only
+* `--output FILE` + `--format json|csv|tsv` write results to file
+* `--prefer-geo TAG` prefer mirrors matching `geo` tag/keyword
+
 ### 1) Check DNS servers + best DNS
 
 ```bash
 ./mirrorknife.py dns --servers dns_iran.txt --domain pypi.org --best
+```
+
+Export DNS snippets:
+
+```bash
+./mirrorknife.py dns --servers dns_iran.txt --best --export-resolvconf resolv.conf
+./mirrorknife.py dns --servers dns_iran.txt --best --export-hosts hosts.txt
+```
+
+Quick modes:
+
+```bash
+./mirrorknife.py dns --servers dns_iran.txt --quick --only-best
+./mirrorknife.py dns --servers dns_iran.txt --deep --retries 3
 ```
 
 ### 2) Check mirrors + best per type
@@ -126,10 +157,29 @@ mirrors:
 ./mirrorknife.py mirrors --config mirrors_list.yaml --best
 ```
 
+Export best mirror hosts template:
+
+```bash
+./mirrorknife.py mirrors --config mirrors_list.yaml --best --export-hosts hosts.txt
+```
+
+Prefer local suite + geo tag:
+
+```bash
+./mirrorknife.py mirrors --config mirrors_list.yaml --suite jammy --prefer-geo iran --only-best
+```
+
 ### 3) Only check some kinds
 
 ```bash
 ./mirrorknife.py mirrors --config mirrors_list.yaml --kinds ubuntu,pypi,docker --best
+```
+
+### 3b) Save output to a file
+
+```bash
+./mirrorknife.py mirrors --config mirrors_list.yaml --output report.json --format json
+./mirrorknife.py mirrors --config mirrors_list.yaml --output report.csv --format csv
 ```
 
 ### 4) Docker registry tools
@@ -151,9 +201,24 @@ mirrors:
 ./mirrorknife.py tui --config mirrors_list.yaml --servers dns_iran.txt --domain google.com
 ```
 
+### 6) Init sample files
+
+```bash
+./mirrorknife.py init --dns-file DNSs.txt --mirrors-file mirrors_list.yaml
+```
+
+Overwrite existing files:
+
+```bash
+./mirrorknife.py init --dns-file DNSs.txt --mirrors-file mirrors_list.yaml --force
+```
+
 **TUI keys**
 
 * `r` refresh
+* `l` live refresh toggle
+* `s` sort mode (latency/ok/kind)
+* `t` toggle details panel
 * `/` filter
 * `e` export `mirrorknife_report.json`
 * `b` show best picks
@@ -163,9 +228,10 @@ mirrors:
 
 ## Output & How “Best” is chosen
 
-* DNS “best” = successful DNS answer + lowest `udp_dns_ms`
+* DNS “best” = successful DNS answer + lowest weighted score of UDP/TCP/Ping (UDP preferred)
 * Mirror “best” = successful probe + lowest `total_ms`
 * If something fails, it shows `BAD` and includes a note like timeout/DNS failure/HTTP code.
+* With retries (`--retries`), outputs include `p50_ms`/`p90_ms` stats.
 
 ---
 
@@ -217,9 +283,16 @@ Edit `/etc/docker/daemon.json` (Linux) or Docker Desktop settings (macOS):
 ## Troubleshooting
 
 * **TLS errors / corporate MITM / custom certs**: try `--insecure` (not recommended long-term).
-* **Docker catalog empty / fails**: many registries disable `/v2/_catalog`. Use `tags` for known repos instead.
+* **Docker catalog empty / fails**: many registries disable `/v2/_catalog` or require auth. Use `tags` for known repos instead.
 * **Some mirror URLs are “portal pages”**: those may return 200 but are not repo roots. Prefer direct mirror roots for best results.
 * **npm checks fail**: some mirrors are not a full npm registry. Update the `url:` to the actual registry endpoint (often includes a subpath like `/npm/`).
+
+## YAML-lite rules (mirrors_list.yaml)
+
+* Each mirror entry must include `name`, `url`, and `packages`.
+* `packages` must be a list of `- Item` lines indented under `packages:`.
+* Other keys (like `description`) are allowed and ignored by the parser.
+* Optional `geo`, `region`, or `country` fields can be used with `--prefer-geo`.
 
 ---
 
@@ -251,10 +324,7 @@ Edit `/etc/docker/daemon.json` (Linux) or Docker Desktop settings (macOS):
   * زمان اتصال TCP به پورت ۵۳
   * زمان Query روی TCP
   * میانگین ping
-* انتخاب بهترین DNS بر اساس:
-
-  * موفقیت در Resolve دامنه
-  * کمترین زمان `udp_dns_ms`
+* انتخاب بهترین DNS بر اساس امتیاز ترکیبی UDP/TCP/Ping
 
 ### ابزار Mirrors
 
@@ -265,12 +335,20 @@ Edit `/etc/docker/daemon.json` (Linux) or Docker Desktop settings (macOS):
 * **npm**: تست `/-/ping` و `/~/ping` و در نهایت `/`
 * **Ubuntu/Debian**: تست `dists/<suite>/Release` (با حدس مسیرهای رایج)
 * **RHEL-family**: تست `repodata/repomd.xml` با مسیرهای رایج
+* **Maven/Gradle**: تست روت‌های رایج ریپازیتوری
+* **Go modules**: تست مسیرهای proxy
+* **NuGet**: تست `v3/index.json`
+* **Composer**: تست `packages.json`
 
 ### ابزار Docker
 
 * `ping`: تست `/v2/`
 * `catalog`: لیست ریپوها از `/v2/_catalog` (خیلی وقت‌ها غیرفعال است)
 * `tags`: لیست تگ‌های یک ریپو مشخص
+
+### ابزار Init
+
+* `init`: ساخت نمونه فایل‌های `DNSs.txt` و `mirrors_list.yaml`
 
 ### TUI (اختیاری)
 
@@ -337,10 +415,26 @@ mirrors:
 
 ## دستورات (فارسی)
 
+### گزینه‌های سراسری
+
+* `--quick` حالت سریع
+* `--deep` حالت دقیق با زمان بیشتر
+* `--retries N` تعداد تلاش برای هر هدف
+* `--only-best` فقط بهترین‌ها را چاپ کن
+* `--output FILE` + `--format json|csv|tsv` ذخیره خروجی
+* `--prefer-geo TAG` اولویت به geo/region
+
 ### تست DNS و انتخاب بهترین
 
 ```bash
 ./mirrorknife.py dns --servers dns_iran.txt --domain pypi.org --best
+```
+
+خروجی فایل نمونه DNS:
+
+```bash
+./mirrorknife.py dns --servers dns_iran.txt --best --export-resolvconf resolv.conf
+./mirrorknife.py dns --servers dns_iran.txt --best --export-hosts hosts.txt
 ```
 
 ### تست Mirror ها و انتخاب بهترین‌ها
@@ -349,10 +443,23 @@ mirrors:
 ./mirrorknife.py mirrors --config mirrors_list.yaml --best
 ```
 
+خروجی فایل hosts برای بهترین Mirrorها:
+
+```bash
+./mirrorknife.py mirrors --config mirrors_list.yaml --best --export-hosts hosts.txt
+```
+
 ### تست فقط بعضی دسته‌ها
 
 ```bash
 ./mirrorknife.py mirrors --config mirrors_list.yaml --kinds ubuntu,pypi,docker --best
+```
+
+### ذخیره خروجی در فایل
+
+```bash
+./mirrorknife.py mirrors --config mirrors_list.yaml --output report.json --format json
+./mirrorknife.py mirrors --config mirrors_list.yaml --output report.csv --format csv
 ```
 
 ### ابزار Docker
@@ -369,9 +476,24 @@ mirrors:
 ./mirrorknife.py tui --config mirrors_list.yaml --servers dns_iran.txt --domain google.com
 ```
 
+### ساخت فایل‌های نمونه
+
+```bash
+./mirrorknife.py init --dns-file DNSs.txt --mirrors-file mirrors_list.yaml
+```
+
+بازنویسی فایل‌های موجود:
+
+```bash
+./mirrorknife.py init --dns-file DNSs.txt --mirrors-file mirrors_list.yaml --force
+```
+
 کلیدها:
 
 * `r` بروزرسانی
+* `l` روشن/خاموش کردن refresh خودکار
+* `s` تغییر ترتیب (latency/ok/kind)
+* `t` نمایش/عدم نمایش پنل جزئیات
 * `/` فیلتر
 * `e` خروجی `mirrorknife_report.json`
 * `b` نمایش بهترین‌ها
@@ -382,9 +504,16 @@ mirrors:
 ## نکات رفع مشکل
 
 * خطای SSL/TLS: از `--insecure` استفاده کنید (موقت و غیر پیشنهادی)
-* `catalog` در Docker کار نکرد: طبیعی است؛ خیلی از رجیستری‌ها این قابلیت را خاموش می‌کنند
+* `catalog` در Docker کار نکرد: طبیعی است؛ خیلی از رجیستری‌ها این قابلیت را خاموش می‌کنند یا نیاز به احراز هویت دارند
 * بعضی URLها صفحه معرفی هستند نه روت ریپو: بهتر است `url:` را روی روت واقعی مخزن تنظیم کنید
 * npm: اگر `/ping` جواب نمی‌دهد، احتمالاً URL شما روت Registry واقعی نیست و نیاز به subpath دارد
+
+## قوانین YAML-lite (mirrors_list.yaml)
+
+* هر آیتم باید `name`، `url` و `packages` داشته باشد
+* زیر `packages` باید لیست `- Item` با تورفتگی مناسب بیاید
+* کلیدهای دیگر مثل `description` مجاز هستند و توسط parser نادیده گرفته می‌شوند
+* فیلدهای `geo` یا `region` یا `country` برای `--prefer-geo` قابل استفاده هستند
 
 ---
 

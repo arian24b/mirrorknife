@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import curses
 import json
+import os
 import platform
 import random
 import re
@@ -33,10 +34,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse, urlencode
 import urllib.request
+import urllib.error
 
 
 DEFAULT_TIMEOUT = 6.0
 DEFAULT_JOBS = 32
+DEFAULT_RETRIES = 1
 
 UBUNTU_SUITES = ["noble", "jammy", "focal"]
 DEBIAN_SUITES = ["stable", "bookworm", "bullseye"]
@@ -62,6 +65,7 @@ class Result:
     note: str
     probe: str  # URL or "dns"
     timings_ms: Dict[str, Optional[int]]
+    stats_ms: Dict[str, Optional[int]]
 
 
 # ------------------ Small utils ------------------
@@ -69,6 +73,18 @@ class Result:
 
 def ms_now() -> int:
     return int(time.perf_counter() * 1000)
+
+
+def percentile_ms(vals: List[int], p: float) -> Optional[int]:
+    if not vals:
+        return None
+    if p <= 0:
+        return min(vals)
+    if p >= 100:
+        return max(vals)
+    vals_sorted = sorted(vals)
+    k = int(round((p / 100.0) * (len(vals_sorted) - 1)))
+    return vals_sorted[max(0, min(k, len(vals_sorted) - 1))]
 
 
 def is_macos() -> bool:
@@ -130,6 +146,23 @@ def load_lines(path: str) -> List[str]:
     return out
 
 
+def detect_suite() -> Optional[str]:
+    if not platform.system().lower().startswith("linux"):
+        return None
+    try:
+        with open("/etc/os-release", "r", encoding="utf-8") as f:
+            data = f.read().splitlines()
+    except Exception:
+        return None
+    vals: Dict[str, str] = {}
+    for line in data:
+        if not line or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        vals[k.strip()] = v.strip().strip('"')
+    return vals.get("VERSION_CODENAME") or vals.get("UBUNTU_CODENAME")
+
+
 def safe_addnstr(win, y: int, x: int, s: str, n: int, attr: int = 0) -> None:
     try:
         h, w = win.getmaxyx()
@@ -182,11 +215,24 @@ def parse_mirrors_yaml_lite(path: str) -> List[dict]:
     mirrors: List[dict] = []
     cur: Optional[dict] = None
     in_packages = False
+    packages_indent = 0
+    item_indent = 0
 
     for raw in lines:
-        s = raw.rstrip("\n").strip()
+        raw2 = raw.rstrip("\n")
+        s = raw2.strip()
         if not s or s.startswith("#"):
             continue
+        indent = len(raw2) - len(raw2.lstrip(" "))
+
+        if in_packages:
+            if indent > packages_indent and s.startswith("-"):
+                m = re.match(r"^-+\s*(.+)\s*$", s)
+                if m:
+                    if cur is not None:
+                        cur["packages"].append(m.group(1).strip().strip('"').strip("'"))
+                    continue
+            in_packages = False
 
         if re.match(r"^mirrors\s*:\s*$", s):
             continue
@@ -199,8 +245,10 @@ def parse_mirrors_yaml_lite(path: str) -> List[dict]:
                 "name": m.group(1).strip().strip('"').strip("'"),
                 "url": "",
                 "packages": [],
+                "geo": "",
             }
             in_packages = False
+            item_indent = indent
             continue
 
         if cur is None:
@@ -216,17 +264,15 @@ def parse_mirrors_yaml_lite(path: str) -> List[dict]:
             cur["url"] = m.group(1).strip().strip('"').strip("'")
             continue
 
-        if re.match(r"^packages\s*:\s*$", s):
-            in_packages = True
+        m = re.match(r"^(geo|region|country)\s*:\s*(.+)\s*$", s, re.I)
+        if m:
+            cur["geo"] = m.group(2).strip().strip('"').strip("'")
             continue
 
-        if in_packages:
-            m = re.match(r"^-+\s*(.+)\s*$", s)
-            if m:
-                cur["packages"].append(m.group(1).strip().strip('"').strip("'"))
-                continue
-            if ":" in s:
-                in_packages = False
+        if re.match(r"^packages\s*:\s*$", s):
+            in_packages = True
+            packages_indent = indent
+            continue
 
     if cur:
         mirrors.append(cur)
@@ -237,7 +283,14 @@ def parse_mirrors_yaml_lite(path: str) -> List[dict]:
         if not url:
             continue
         pkgs = [p.strip() for p in m.get("packages", []) if p.strip()]
-        cleaned.append({"name": m.get("name", url), "url": url, "packages": pkgs})
+        cleaned.append(
+            {
+                "name": m.get("name", url),
+                "url": url,
+                "packages": pkgs,
+                "geo": (m.get("geo", "") or "").strip(),
+            }
+        )
     return cleaned
 
 
@@ -252,25 +305,41 @@ def targets_from_mirror_yaml(path: str) -> List[Target]:
         name = m["name"]
         url = m["url"]
         pkgs = m["packages"]
+        geo = m.get("geo", "")
+        meta = {"geo": geo} if geo else {}
 
         if has("Docker Registry", pkgs):
-            out.append(Target("docker", name, url, {}))
+            out.append(Target("docker", name, url, dict(meta)))
         if has("PyPI", pkgs):
-            out.append(Target("pypi", name, url, {}))
+            out.append(Target("pypi", name, url, dict(meta)))
         if has("npm", pkgs):
-            out.append(Target("npm", name, url, {}))
+            out.append(Target("npm", name, url, dict(meta)))
+        if (
+            has("Maven Central", pkgs)
+            or has("Google Maven", pkgs)
+            or has("Jitpack Maven", pkgs)
+        ):
+            out.append(Target("maven", name, url, dict(meta)))
+        if has("Gradle", pkgs):
+            out.append(Target("gradle", name, url, dict(meta)))
+        if has("Go", pkgs):
+            out.append(Target("go", name, url, dict(meta)))
+        if has("NuGet", pkgs):
+            out.append(Target("nuget", name, url, dict(meta)))
+        if has("Composer", pkgs):
+            out.append(Target("composer", name, url, dict(meta)))
 
         if has("Ubuntu", pkgs):
-            out.append(Target("ubuntu", name, url, {}))
+            out.append(Target("ubuntu", name, url, dict(meta)))
         if has("Debian", pkgs):
-            out.append(Target("debian", name, url, {}))
+            out.append(Target("debian", name, url, dict(meta)))
 
         # RHEL-ish: CentOS/Rocky/Alma/EPEL -> treat as yum/dnf metadata
         if any(
             p.lower() in ("centos", "rocky linux", "almalinux", "epel", "fedora epel")
             for p in pkgs
         ):
-            out.append(Target("rhel", name, url, {}))
+            out.append(Target("rhel", name, url, dict(meta)))
 
     return out
 
@@ -375,7 +444,7 @@ def dns_tcp_query(
 
 
 def dns_probe(ip: str, domain: str, timeout: float) -> Result:
-    timings = {
+    timings: Dict[str, Optional[int]] = {
         "udp_dns_ms": None,
         "tcp_53_ms": None,
         "tcp_dns_ms": None,
@@ -396,10 +465,12 @@ def dns_probe(ip: str, domain: str, timeout: float) -> Result:
 
     timings["ping_ms"] = ping_avg_ms(ip)
 
-    ok = rcode == 0 and (an or 0) > 0
-    status = rcode if rcode is not None else None
+    ok_udp = rcode == 0 and (an or 0) > 0
+    ok_tcp = rcode2 == 0 and (an2 or 0) > 0
+    ok = ok_udp or ok_tcp
+    status = rcode if rcode is not None else rcode2
     note = f"UDP:{note_udp} | TCP:{note_tcp}"
-    return Result("dns", ip, ip, ok, status, note, "dns", timings)
+    return Result("dns", ip, ip, ok, status, note, "dns", timings, {})
 
 
 # ------------------ HTTP GET with split timings (dns/tcp/tls/ttfb/total) ------------------
@@ -579,6 +650,10 @@ def pypi_probe(
     url = join_url(base, "simple/")
     st, tm, note, hdr = http_timed_get(url, timeout, insecure)
     ok = st == 200
+    ct = (hdr.get("content-type") or "").lower()
+    if ct and ("html" not in ct and "simple" not in ct):
+        ok = False
+        note = f"Unexpected content-type: {ct}"
     return ok, st, tm, note, url
 
 
@@ -598,9 +673,17 @@ def npm_probe(
 
 
 def apt_probe(
-    base: str, kind: str, timeout: float, insecure: bool
+    base: str,
+    kind: str,
+    timeout: float,
+    insecure: bool,
+    preferred_suites: Optional[List[str]] = None,
 ) -> Tuple[bool, Optional[int], Dict[str, Optional[int]], str, str, str]:
     suites = UBUNTU_SUITES if kind == "ubuntu" else DEBIAN_SUITES
+    if preferred_suites:
+        suites = [s for s in preferred_suites if s] + [
+            s for s in suites if s not in preferred_suites
+        ]
     # Some mirrors host multiple distros under the same domain
     subpaths = (
         ["", "ubuntu/", "debian/"] if kind == "ubuntu" else ["", "debian/", "ubuntu/"]
@@ -612,7 +695,8 @@ def apt_probe(
         for suite in suites:
             url = join_url(base2, f"dists/{suite}/Release")
             st, tm, note, hdr = http_timed_get(url, timeout, insecure)
-            if st == 200:
+            ct = (hdr.get("content-type") or "").lower()
+            if st == 200 and (not ct or "text" in ct or "octet-stream" in ct):
                 return (
                     True,
                     st,
@@ -656,6 +740,63 @@ def rhel_probe(
                 return True, st, tm, f"OK ({r or '/'}{c})", url, base2
             last = (False, st, tm, f"{note} ({r or '/'}{c})", url, base2)
     return last
+
+
+def maven_like_probe(
+    base: str, timeout: float, insecure: bool
+) -> Tuple[bool, Optional[int], Dict[str, Optional[int]], str, str]:
+    candidates = ["maven2/", "repo/", "repository/", ""]
+    last = (False, None, {}, "No candidates", base)
+    for c in candidates:
+        url = join_url(base, c) if c else base
+        st, tm, note, hdr = http_timed_get(url, timeout, insecure)
+        if st == 200:
+            return True, st, tm, "OK", url
+        last = (False, st, tm, f"{note} (tried {c or '/'})", url)
+    return last
+
+
+def go_proxy_probe(
+    base: str, timeout: float, insecure: bool
+) -> Tuple[bool, Optional[int], Dict[str, Optional[int]], str, str]:
+    candidates = [
+        "github.com/golang/net/@v/list",
+        "golang.org/x/text/@v/list",
+    ]
+    last = (False, None, {}, "No candidates", base)
+    for c in candidates:
+        url = join_url(base, c)
+        st, tm, note, hdr = http_timed_get(url, timeout, insecure)
+        if st == 200:
+            return True, st, tm, "OK", url
+        last = (False, st, tm, f"{note} (tried {c})", url)
+    return last
+
+
+def nuget_probe(
+    base: str, timeout: float, insecure: bool
+) -> Tuple[bool, Optional[int], Dict[str, Optional[int]], str, str]:
+    url = join_url(base, "v3/index.json")
+    st, tm, note, hdr = http_timed_get(url, timeout, insecure)
+    ok = st == 200
+    ct = (hdr.get("content-type") or "").lower()
+    if ct and "json" not in ct:
+        ok = False
+        note = f"Unexpected content-type: {ct}"
+    return ok, st, tm, note, url
+
+
+def composer_probe(
+    base: str, timeout: float, insecure: bool
+) -> Tuple[bool, Optional[int], Dict[str, Optional[int]], str, str]:
+    url = join_url(base, "packages.json")
+    st, tm, note, hdr = http_timed_get(url, timeout, insecure)
+    ok = st == 200
+    ct = (hdr.get("content-type") or "").lower()
+    if ct and "json" not in ct:
+        ok = False
+        note = f"Unexpected content-type: {ct}"
+    return ok, st, tm, note, url
 
 
 # ------------------ Docker introspection (catalog + tags) ------------------
@@ -714,8 +855,20 @@ def docker_tags(
 
 def primary_latency(r: Result) -> int:
     if r.kind == "dns":
-        return r.timings_ms.get("udp_dns_ms") or 10**9
+        return r.timings_ms.get("udp_dns_ms") or r.timings_ms.get("tcp_dns_ms") or 10**9
     return r.timings_ms.get("total_ms") or 10**9
+
+
+def dns_score(r: Result) -> int:
+    if not r.ok:
+        return 10**9
+    udp = r.timings_ms.get("udp_dns_ms")
+    tcp = r.timings_ms.get("tcp_dns_ms")
+    ping = r.timings_ms.get("ping_ms")
+    udp_v = udp if udp is not None else (tcp if tcp is not None else 1000)
+    tcp_v = tcp if tcp is not None else (udp if udp is not None else 1000)
+    ping_v = ping if ping is not None else 1000
+    return int(udp_v * 0.6 + tcp_v * 0.2 + ping_v * 0.2)
 
 
 def probe_one(t: Target, timeout: float, insecure: bool) -> Result:
@@ -724,19 +877,37 @@ def probe_one(t: Target, timeout: float, insecure: bool) -> Result:
 
     if t.kind == "docker":
         ok, st, tm, note, url = docker_probe(t.base, timeout, insecure)
-        return Result("docker", t.name, t.base, ok, st, note, url, tm)
+        return Result("docker", t.name, t.base, ok, st, note, url, tm, {})
 
     if t.kind == "pypi":
         ok, st, tm, note, url = pypi_probe(t.base, timeout, insecure)
-        return Result("pypi", t.name, t.base, ok, st, note, url, tm)
+        return Result("pypi", t.name, t.base, ok, st, note, url, tm, {})
 
     if t.kind == "npm":
         ok, st, tm, note, url = npm_probe(t.base, timeout, insecure)
-        return Result("npm", t.name, t.base, ok, st, note, url, tm)
+        return Result("npm", t.name, t.base, ok, st, note, url, tm, {})
+
+    if t.kind in ("maven", "gradle"):
+        ok, st, tm, note, url = maven_like_probe(t.base, timeout, insecure)
+        return Result(t.kind, t.name, t.base, ok, st, note, url, tm, {})
+
+    if t.kind == "go":
+        ok, st, tm, note, url = go_proxy_probe(t.base, timeout, insecure)
+        return Result("go", t.name, t.base, ok, st, note, url, tm, {})
+
+    if t.kind == "nuget":
+        ok, st, tm, note, url = nuget_probe(t.base, timeout, insecure)
+        return Result("nuget", t.name, t.base, ok, st, note, url, tm, {})
+
+    if t.kind == "composer":
+        ok, st, tm, note, url = composer_probe(t.base, timeout, insecure)
+        return Result("composer", t.name, t.base, ok, st, note, url, tm, {})
 
     if t.kind in ("ubuntu", "debian"):
+        preferred = t.meta.get("suite") if t.meta else None
+        preferred_suites = [preferred] if preferred else None
         ok, st, tm, note, url, effective_base = apt_probe(
-            t.base, t.kind, timeout, insecure
+            t.base, t.kind, timeout, insecure, preferred_suites
         )
         return Result(
             t.kind,
@@ -747,6 +918,7 @@ def probe_one(t: Target, timeout: float, insecure: bool) -> Result:
             note + f" | effective_base={effective_base}",
             url,
             tm,
+            {},
         )
 
     if t.kind == "rhel":
@@ -760,21 +932,82 @@ def probe_one(t: Target, timeout: float, insecure: bool) -> Result:
             note + f" | effective_base={effective_base}",
             url,
             tm,
+            {},
         )
 
-    return Result(t.kind, t.name, t.base, False, None, "Unknown kind", "", {})
+    return Result(t.kind, t.name, t.base, False, None, "Unknown kind", "", {}, {})
+
+
+def probe_with_retries(
+    t: Target, retries: int, timeout: float, insecure: bool
+) -> Result:
+    attempts = max(1, int(retries))
+    best: Optional[Result] = None
+    best_lat = 10**9
+    ok_latencies: List[int] = []
+
+    for _ in range(attempts):
+        r = probe_one(t, timeout, insecure)
+        if r.ok:
+            lat = primary_latency(r)
+            if lat < 10**9:
+                ok_latencies.append(lat)
+            if lat < best_lat:
+                best = r
+                best_lat = lat
+        if best is None:
+            best = r
+
+    if best is None:
+        best = Result(t.kind, t.name, t.base, False, None, "No result", "", {}, {})
+
+    geo = t.meta.get("geo") if t.meta else ""
+    if geo:
+        best.note = f"{best.note} | geo={geo}".strip()
+
+    best.stats_ms = {
+        "p50_ms": percentile_ms(ok_latencies, 50),
+        "p90_ms": percentile_ms(ok_latencies, 90),
+        "attempts": attempts,
+        "ok_count": len(ok_latencies),
+    }
+    return best
 
 
 def run_checks(
-    targets: List[Target], jobs: int, timeout: float, insecure: bool
+    targets: List[Target],
+    jobs: int,
+    timeout: float,
+    insecure: bool,
+    retries: int,
+    prefer_geo: str = "",
 ) -> List[Result]:
     out: List[Result] = []
     with ThreadPoolExecutor(max_workers=jobs) as ex:
-        futs = [ex.submit(probe_one, t, timeout, insecure) for t in targets]
+        futs = [
+            ex.submit(probe_with_retries, t, retries, timeout, insecure)
+            for t in targets
+        ]
         for f in as_completed(futs):
             out.append(f.result())
 
-    out.sort(key=lambda r: (not r.ok, primary_latency(r), r.kind, r.name))
+    prefer_geo = (prefer_geo or "").strip().lower()
+
+    def geo_match(r: Result) -> bool:
+        if not prefer_geo:
+            return False
+        hay = f"{r.base} {r.name} {r.note}".lower()
+        return prefer_geo in hay
+
+    def sort_key(r: Result):
+        if r.kind == "dns":
+            lat_key = dns_score(r)
+        else:
+            lat_key = primary_latency(r)
+        geo_penalty = 0 if (not prefer_geo or geo_match(r)) else 1
+        return (not r.ok, geo_penalty, lat_key, r.kind, r.name)
+
+    out.sort(key=sort_key)
     return out
 
 
@@ -782,7 +1015,10 @@ def pick_best(results: List[Result], kind: str) -> Optional[Result]:
     cands = [r for r in results if r.kind == kind and r.ok]
     if not cands:
         return None
-    cands.sort(key=lambda r: primary_latency(r))
+    if kind == "dns":
+        cands.sort(key=lambda r: dns_score(r))
+    else:
+        cands.sort(key=lambda r: primary_latency(r))
     return cands[0]
 
 
@@ -807,6 +1043,53 @@ def print_table(
         print(f"{ok:<3} {r.kind:<7} {lat_txt:>7}  {name:<24}  {r.base}")
 
 
+def write_results_output(results: List[Result], path: str, fmt: str) -> None:
+    if not path:
+        return
+    fmt = (fmt or "json").lower()
+    if fmt == "json":
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump([asdict(r) for r in results], f, indent=2, ensure_ascii=False)
+        return
+
+    if fmt not in ("csv", "tsv"):
+        raise ValueError(f"Unsupported format: {fmt}")
+
+    sep = "," if fmt == "csv" else "\t"
+    headers = [
+        "kind",
+        "name",
+        "base",
+        "ok",
+        "status",
+        "probe",
+        "latency_ms",
+        "p50_ms",
+        "p90_ms",
+        "note",
+    ]
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(sep.join(headers) + "\n")
+        for r in results:
+            row = [
+                r.kind,
+                r.name,
+                r.base,
+                str(r.ok),
+                "" if r.status is None else str(r.status),
+                r.probe,
+                str(primary_latency(r) if primary_latency(r) < 10**9 else ""),
+                ""
+                if r.stats_ms.get("p50_ms") is None
+                else str(r.stats_ms.get("p50_ms")),
+                ""
+                if r.stats_ms.get("p90_ms") is None
+                else str(r.stats_ms.get("p90_ms")),
+                r.note.replace("\n", " "),
+            ]
+            f.write(sep.join(row) + "\n")
+
+
 def print_best_snippets(results: List[Result], dns_domain: str) -> None:
     best_dns = pick_best(results, "dns")
     best_ubuntu = pick_best(results, "ubuntu")
@@ -815,11 +1098,25 @@ def print_best_snippets(results: List[Result], dns_domain: str) -> None:
     best_pypi = pick_best(results, "pypi")
     best_npm = pick_best(results, "npm")
     best_docker = pick_best(results, "docker")
+    best_maven = pick_best(results, "maven")
+    best_gradle = pick_best(results, "gradle")
+    best_go = pick_best(results, "go")
+    best_nuget = pick_best(results, "nuget")
+    best_composer = pick_best(results, "composer")
 
     print("\n=== BEST PICKS ===")
     if best_dns:
+        udp_ms = best_dns.timings_ms.get("udp_dns_ms")
+        tcp_ms = best_dns.timings_ms.get("tcp_dns_ms")
+        ping_ms = best_dns.timings_ms.get("ping_ms")
+        if udp_ms is not None:
+            dns_lat = f"udp_dns={udp_ms}ms"
+        elif tcp_ms is not None:
+            dns_lat = f"tcp_dns={tcp_ms}ms"
+        else:
+            dns_lat = "dns=--"
         print(
-            f"DNS best for {dns_domain}: {best_dns.name}  (udp_dns={best_dns.timings_ms.get('udp_dns_ms')}ms, ping={best_dns.timings_ms.get('ping_ms')}ms)"
+            f"DNS best for {dns_domain}: {best_dns.name}  ({dns_lat}, ping={ping_ms if ping_ms is not None else '--'}ms)"
         )
     else:
         print(f"DNS best for {dns_domain}: (none healthy)")
@@ -838,6 +1135,11 @@ def print_best_snippets(results: List[Result], dns_domain: str) -> None:
     show("ubun", best_ubuntu)
     show("debi", best_debian)
     show("rhel", best_rhel)
+    show("mavn", best_maven)
+    show("grad", best_gradle)
+    show("  go", best_go)
+    show("nuge", best_nuget)
+    show("comp", best_composer)
 
     print("\n=== COPY/PASTE CONFIG SNIPPETS ===")
 
@@ -859,6 +1161,39 @@ def print_best_snippets(results: List[Result], dns_domain: str) -> None:
         b = best_docker.base.rstrip("/")
         print("\n# Docker daemon.json")
         print('{\n  "registry-mirrors": ["' + f"{b}" + '"]\n}')
+
+    if best_maven:
+        b = best_maven.base.rstrip("/")
+        print("\n# Maven settings.xml mirror")
+        print(
+            "<mirror>\n  <id>local-mirror</id>\n  <mirrorOf>*</mirrorOf>\n  <url>"
+            + f"{b}"
+            + "</url>\n</mirror>"
+        )
+
+    if best_gradle:
+        b = best_gradle.base.rstrip("/")
+        print("\n# Gradle init.gradle")
+        print(
+            'allprojects {\n  repositories {\n    maven { url "'
+            + f"{b}"
+            + '" }\n  }\n}'
+        )
+
+    if best_go:
+        b = best_go.base.rstrip("/")
+        print("\n# Go module proxy")
+        print(f"export GOPROXY={b},direct")
+
+    if best_nuget:
+        b = best_nuget.base.rstrip("/")
+        print("\n# NuGet source")
+        print(f"dotnet nuget add source {b}/v3/index.json -n local")
+
+    if best_composer:
+        b = best_composer.base.rstrip("/")
+        print("\n# Composer repository")
+        print(f"composer config repo.local composer {b}")
 
     if best_ubuntu:
         print("\n# Ubuntu APT base (use effective_base):")
@@ -884,32 +1219,86 @@ def cmd_dns(args: argparse.Namespace) -> int:
     servers = load_lines(args.servers)
     domain = args.domain
     targets = [Target("dns", ip, ip, {"domain": domain}) for ip in servers]
-    results = run_checks(targets, args.jobs, args.timeout, args.insecure)
-    print_table(results, kinds=["dns"], limit=args.limit)
-    if args.best or args.snippets:
+    results = run_checks(
+        targets, args.jobs, args.timeout, args.insecure, args.retries, args.prefer_geo
+    )
+    if not args.only_best:
+        print_table(results, kinds=["dns"], limit=args.limit)
+    if args.best or args.snippets or args.only_best:
         print_best_snippets(results, domain)
     if args.json:
         print(json.dumps([asdict(r) for r in results], indent=2, ensure_ascii=False))
+    if args.output:
+        write_results_output(results, args.output, args.format)
+
+    if args.export_resolvconf:
+        best = pick_best(results, "dns")
+        if best:
+            with open(args.export_resolvconf, "w", encoding="utf-8") as f:
+                f.write(f"nameserver {best.name}\n")
+
+    if args.export_hosts:
+        best = pick_best(results, "dns")
+        if best:
+            with open(args.export_hosts, "w", encoding="utf-8") as f:
+                f.write("# Host entry for best DNS (alias: dns-best)\n")
+                f.write(f"{best.name}\tdns-best\n")
     return 0
 
 
 def cmd_mirrors(args: argparse.Namespace) -> int:
     targets = targets_from_mirror_yaml(args.config)
 
+    suite = args.suite or detect_suite()
+    if suite:
+        for t in targets:
+            if t.kind in ("ubuntu", "debian"):
+                t.meta = dict(t.meta)
+                t.meta["suite"] = suite
+
     # optional filter by kinds
     if args.kinds:
         ks = set(k.strip().lower() for k in args.kinds.split(",") if k.strip())
         targets = [t for t in targets if t.kind.lower() in ks]
 
-    results = run_checks(targets, args.jobs, args.timeout, args.insecure)
-    print_table(results, kinds=None, limit=args.limit)
+    results = run_checks(
+        targets, args.jobs, args.timeout, args.insecure, args.retries, args.prefer_geo
+    )
+    if not args.only_best:
+        print_table(results, kinds=None, limit=args.limit)
 
-    if args.best or args.snippets:
+    if args.best or args.snippets or args.only_best:
         # domain only matters for DNS; pass a dummy string here
         print_best_snippets(results, dns_domain="(n/a)")
 
     if args.json:
         print(json.dumps([asdict(r) for r in results], indent=2, ensure_ascii=False))
+    if args.output:
+        write_results_output(results, args.output, args.format)
+
+    if args.export_hosts:
+        bests = {
+            "pypi": pick_best(results, "pypi"),
+            "npm": pick_best(results, "npm"),
+            "docker": pick_best(results, "docker"),
+            "ubuntu": pick_best(results, "ubuntu"),
+            "debian": pick_best(results, "debian"),
+            "rhel": pick_best(results, "rhel"),
+            "maven": pick_best(results, "maven"),
+            "gradle": pick_best(results, "gradle"),
+            "go": pick_best(results, "go"),
+            "nuget": pick_best(results, "nuget"),
+            "composer": pick_best(results, "composer"),
+        }
+        with open(args.export_hosts, "w", encoding="utf-8") as f:
+            f.write("# Replace IPs with actual mirror IPs\n")
+            for k, v in bests.items():
+                if not v:
+                    continue
+                host = urlparse(v.base).hostname
+                if not host:
+                    continue
+                f.write(f"0.0.0.0\t{host}\t# {k}\n")
     return 0
 
 
@@ -921,8 +1310,10 @@ def cmd_docker(args: argparse.Namespace) -> int:
 
     if args.action == "ping":
         ok, st, tm, note, url = docker_probe(base, args.timeout, args.insecure)
-        r = Result("docker", base, base, ok, st, note, url, tm)
+        r = Result("docker", base, base, ok, st, note, url, tm, {})
         print_table([r], limit=10)
+        if args.output:
+            write_results_output([r], args.output, args.format)
         return 0 if ok else 1
 
     if args.action == "catalog":
@@ -930,6 +1321,15 @@ def cmd_docker(args: argparse.Namespace) -> int:
         print(f"Catalog from {base} -> {note}")
         for r in repos:
             print(" -", r)
+        if args.output:
+            fmt = (args.format or "json").lower()
+            if fmt == "json":
+                with open(args.output, "w", encoding="utf-8") as f:
+                    json.dump(repos, f, indent=2, ensure_ascii=False)
+            else:
+                with open(args.output, "w", encoding="utf-8") as f:
+                    for r in repos:
+                        f.write(f"{r}\n")
         return 0 if repos else 1
 
     if args.action == "tags":
@@ -937,6 +1337,15 @@ def cmd_docker(args: argparse.Namespace) -> int:
         print(f"Tags for {args.repo} @ {base} -> {note}")
         for t in tags:
             print(" -", t)
+        if args.output:
+            fmt = (args.format or "json").lower()
+            if fmt == "json":
+                with open(args.output, "w", encoding="utf-8") as f:
+                    json.dump(tags, f, indent=2, ensure_ascii=False)
+            else:
+                with open(args.output, "w", encoding="utf-8") as f:
+                    for t in tags:
+                        f.write(f"{t}\n")
         return 0 if tags else 1
 
     return 2
@@ -950,6 +1359,13 @@ def cmd_tui(args: argparse.Namespace) -> int:
         for ip in load_lines(args.servers):
             targets.append(Target("dns", ip, ip, {"domain": args.domain}))
 
+    suite = detect_suite()
+    if suite:
+        for t in targets:
+            if t.kind in ("ubuntu", "debian"):
+                t.meta = dict(t.meta)
+                t.meta["suite"] = suite
+
     if args.kinds:
         ks = set(k.strip().lower() for k in args.kinds.split(",") if k.strip())
         targets = [t for t in targets if t.kind.lower() in ks]
@@ -959,7 +1375,15 @@ def cmd_tui(args: argparse.Namespace) -> int:
         return 2
 
     curses.wrapper(
-        _tui_main, targets, args.jobs, args.timeout, args.insecure, args.domain
+        _tui_main,
+        targets,
+        args.jobs,
+        args.timeout,
+        args.insecure,
+        args.domain,
+        args.retries,
+        args.prefer_geo,
+        args.interval,
     )
     return 0
 
@@ -979,112 +1403,133 @@ def cmd_dns_live(args: argparse.Namespace) -> int:
         last_run = 0.0
         running = False
 
-        while True:
-            now = time.time()
+        ex: Optional[ThreadPoolExecutor] = None
+        futures = {}
+        try:
+            while True:
+                now = time.time()
 
-            # kick a run periodically (or first time)
-            if (not running) and (now - last_run >= interval):
-                running = True
-                last_run = now
-                results_map = {
-                    t.name: Result(
-                        "dns",
-                        t.name,
-                        t.base,
-                        False,
-                        None,
-                        "pending",
-                        "dns",
-                        {
-                            "udp_dns_ms": None,
-                            "tcp_53_ms": None,
-                            "tcp_dns_ms": None,
-                            "ping_ms": None,
-                        },
-                    )
-                    for t in targets
-                }
+                # kick a run periodically (or first time)
+                if (not running) and (now - last_run >= interval):
+                    running = True
+                    last_run = now
+                    empty_timings: Dict[str, Optional[int]] = {
+                        "udp_dns_ms": None,
+                        "tcp_53_ms": None,
+                        "tcp_dns_ms": None,
+                        "ping_ms": None,
+                    }
+                    results_map = {
+                        t.name: Result(
+                            "dns",
+                            t.name,
+                            t.base,
+                            False,
+                            None,
+                            "pending",
+                            "dns",
+                            dict(empty_timings),
+                            {},
+                        )
+                        for t in targets
+                    }
 
-                # run probes in background threads
-                ex = ThreadPoolExecutor(max_workers=args.jobs)
-                futures = {
-                    ex.submit(probe_one, t, args.timeout, args.insecure): t.name
-                    for t in targets
-                }
+                    # run probes in background threads
+                    ex = ThreadPoolExecutor(max_workers=args.jobs)
+                    assert ex is not None
+                    futures = {
+                        ex.submit(
+                            probe_with_retries,
+                            t,
+                            args.retries,
+                            args.timeout,
+                            args.insecure,
+                        ): t.name
+                        for t in targets
+                    }
 
-            # consume finished futures (if any)
-            if running:
-                done_any = False
-                for f in list(futures.keys()):
-                    if f.done():
-                        done_any = True
-                        name = futures.pop(f)
-                        try:
-                            results_map[name] = f.result()
-                        except Exception as e:
-                            results_map[name] = Result(
-                                "dns",
-                                name,
-                                name,
-                                False,
-                                None,
-                                f"error: {e}",
-                                "dns",
-                                {
+                # consume finished futures (if any)
+                if running:
+                    done_any = False
+                    for f in list(futures.keys()):
+                        if f.done():
+                            done_any = True
+                            name = futures.pop(f)
+                            try:
+                                results_map[name] = f.result()
+                            except Exception as e:
+                                empty_timings_err: Dict[str, Optional[int]] = {
                                     "udp_dns_ms": None,
                                     "tcp_53_ms": None,
                                     "tcp_dns_ms": None,
                                     "ping_ms": None,
-                                },
-                            )
-                if done_any and not futures:
-                    ex.shutdown(wait=False, cancel_futures=True)
-                    running = False
+                                }
+                                results_map[name] = Result(
+                                    "dns",
+                                    name,
+                                    name,
+                                    False,
+                                    None,
+                                    f"error: {e}",
+                                    "dns",
+                                    empty_timings_err,
+                                    {},
+                                )
+                    if done_any and not futures:
+                        if ex is not None:
+                            ex.shutdown(wait=False, cancel_futures=True)
+                            ex = None
+                        running = False
 
-            # draw
-            stdscr.erase()
-            h, w = stdscr.getmaxyx()
-            safe_addnstr(
-                stdscr,
-                0,
-                0,
-                f"DNS LIVE | domain={domain} | interval={interval}s | r=run now | q=quit",
-                w - 1,
-            )
-            safe_hline(stdscr, 1, 0, ord("-"), w)
+                # draw
+                stdscr.erase()
+                h, w = stdscr.getmaxyx()
+                safe_addnstr(
+                    stdscr,
+                    0,
+                    0,
+                    f"DNS LIVE | domain={domain} | interval={interval}s | r=run now | q=quit",
+                    w - 1,
+                )
+                safe_hline(stdscr, 1, 0, ord("-"), w)
 
-            header = "OK  IP               UDP(ms) TCP53(ms) TCPDNS(ms) PING(ms)  NOTE"
-            safe_addnstr(stdscr, 2, 0, header, w - 1)
+                header = (
+                    "OK  IP               UDP(ms) TCP53(ms) TCPDNS(ms) PING(ms)  NOTE"
+                )
+                safe_addnstr(stdscr, 2, 0, header, w - 1)
 
-            rows = sorted(
-                results_map.values(),
-                key=lambda r: (
-                    not r.ok,
-                    r.timings_ms.get("udp_dns_ms") or 10**9,
-                    r.name,
-                ),
-            )
-            max_rows = max(0, h - 4)
-            for i, r in enumerate(rows[:max_rows]):
-                ok = "✅" if r.ok else "❌"
-                udp = r.timings_ms.get("udp_dns_ms")
-                tcp53 = r.timings_ms.get("tcp_53_ms")
-                tcpdns = r.timings_ms.get("tcp_dns_ms")
-                ping = r.timings_ms.get("ping_ms")
-                note = r.note
+                rows = sorted(
+                    results_map.values(),
+                    key=lambda r: (
+                        not r.ok,
+                        dns_score(r),
+                        r.name,
+                    ),
+                )
+                max_rows = max(0, h - 4)
+                for i, r in enumerate(rows[:max_rows]):
+                    ok = "✅" if r.ok else "❌"
+                    udp = r.timings_ms.get("udp_dns_ms")
+                    tcp53 = r.timings_ms.get("tcp_53_ms")
+                    tcpdns = r.timings_ms.get("tcp_dns_ms")
+                    ping = r.timings_ms.get("ping_ms")
+                    note = r.note
 
-                line = f"{ok}  {r.name:<15} {str(udp or '--'):>7} {str(tcp53 or '--'):>8} {str(tcpdns or '--'):>9} {str(ping or '--'):>8}  {note}"
-                safe_addnstr(stdscr, 3 + i, 0, line, w - 1)
+                    line = f"{ok}  {r.name:<15} {str(udp or '--'):>7} {str(tcp53 or '--'):>8} {str(tcpdns or '--'):>9} {str(ping or '--'):>8}  {note}"
+                    safe_addnstr(stdscr, 3 + i, 0, line, w - 1)
 
-            stdscr.refresh()
+                stdscr.refresh()
 
-            # keys
-            ch = stdscr.getch()
-            if ch in (ord("q"), 27):
-                return
-            if ch == ord("r"):
-                # force immediate re-run
-                last_run = 0.0
+                # keys
+                ch = stdscr.getch()
+                if ch in (ord("q"), 27):
+                    return
+                if ch == ord("r"):
+                    # force immediate re-run
+                    last_run = 0.0
+        finally:
+            if ex is not None:
+                ex.shutdown(wait=False, cancel_futures=True)
 
     curses.wrapper(ui)
     return 0
@@ -1097,13 +1542,20 @@ def _tui_main(
     timeout: float,
     insecure: bool,
     dns_domain: str,
+    retries: int,
+    prefer_geo: str,
+    interval: int,
 ):
     curses.curs_set(0)
     stdscr.nodelay(False)
 
-    results = run_checks(targets, jobs, timeout, insecure)
+    results = run_checks(targets, jobs, timeout, insecure, retries, prefer_geo)
     selected = 0
     filter_txt = ""
+    sort_mode = "lat"
+    show_details = True
+    live_refresh = interval > 0
+    next_run = time.time() + interval if live_refresh else 0.0
 
     def filtered() -> List[Result]:
         if not filter_txt:
@@ -1119,15 +1571,37 @@ def _tui_main(
         ]
 
     while True:
+        if live_refresh and time.time() >= next_run:
+            results = run_checks(targets, jobs, timeout, insecure, retries, prefer_geo)
+            next_run = time.time() + interval
+            selected = 0
+
         stdscr.erase()
         h, w = stdscr.getmaxyx()
-        mid = max(48, w // 2)
+        mid = max(48, w // 2) if show_details else w
 
         left = filtered()
+        if sort_mode == "lat":
+            left = sorted(
+                left,
+                key=lambda r: (
+                    not r.ok,
+                    dns_score(r) if r.kind == "dns" else primary_latency(r),
+                    r.kind,
+                    r.name,
+                ),
+            )
+        elif sort_mode == "ok":
+            left = sorted(left, key=lambda r: (not r.ok, r.kind, r.name))
+        elif sort_mode == "kind":
+            left = sorted(left, key=lambda r: (r.kind, r.name))
         if selected >= len(left):
             selected = max(0, len(left) - 1)
 
-        header = f"mirrorknife TUI | r=refresh  /=filter  e=export  b=best  q=quit | dns-domain={dns_domain}"
+        header = (
+            "mirrorknife TUI | r=refresh  l=live  s=sort  t=toggle  /=filter  e=export  b=best  q=quit"
+            f" | sort={sort_mode} live={'on' if live_refresh else 'off'} | dns-domain={dns_domain}"
+        )
         stdscr.keypad(True)
         stdscr.timeout(150)
         stdscr.addnstr(0, 0, header, w - 1)
@@ -1143,7 +1617,7 @@ def _tui_main(
             line = f"{mark} {status} {r.kind:<7} {lat_txt:>7}  {r.name}"
             stdscr.addnstr(2 + i, 0, line, mid - 1)
 
-        if left:
+        if left and show_details:
             r = left[selected]
             x0 = mid + 1
             stdscr.addnstr(2, x0, "Details", w - x0 - 2)
@@ -1183,8 +1657,19 @@ def _tui_main(
         if ch in (ord("q"), 27):
             return
         if ch == ord("r"):
-            results = run_checks(targets, jobs, timeout, insecure)
+            results = run_checks(targets, jobs, timeout, insecure, retries, prefer_geo)
             selected = 0
+            continue
+        if ch == ord("l"):
+            live_refresh = not live_refresh
+            next_run = time.time() + interval if live_refresh else 0.0
+            continue
+        if ch == ord("s"):
+            sort_mode = {"lat": "ok", "ok": "kind", "kind": "lat"}[sort_mode]
+            selected = 0
+            continue
+        if ch == ord("t"):
+            show_details = not show_details
             continue
         if ch == curses.KEY_DOWN:
             selected = min(selected + 1, max(0, len(left) - 1))
@@ -1255,15 +1740,62 @@ def build_parser() -> argparse.ArgumentParser:
         help="network timeout seconds (default 6)",
     )
     p.add_argument(
+        "--retries",
+        type=int,
+        default=DEFAULT_RETRIES,
+        help="number of attempts per target (default 1)",
+    )
+    p.add_argument(
         "--jobs", type=int, default=DEFAULT_JOBS, help="parallel workers (default 32)"
+    )
+    p.add_argument(
+        "--quick",
+        action="store_true",
+        help="quick preset (lower timeout, fewer retries)",
+    )
+    p.add_argument(
+        "--deep",
+        action="store_true",
+        help="deep preset (higher timeout, more retries)",
     )
     p.add_argument(
         "--insecure",
         action="store_true",
         help="skip TLS verification (not recommended)",
     )
+    p.add_argument(
+        "--output",
+        default="",
+        help="write results to file (json/csv/tsv)",
+    )
+    p.add_argument(
+        "--format",
+        default="json",
+        help="output format for --output (json|csv|tsv)",
+    )
+    p.add_argument(
+        "--only-best",
+        action="store_true",
+        help="skip tables, print only best picks/snippets",
+    )
+    p.add_argument(
+        "--prefer-geo",
+        default="",
+        help="prefer mirrors matching this geo tag/keyword",
+    )
 
     sub = p.add_subparsers(dest="cmd", required=True)
+
+    # init
+    pi = sub.add_parser("init", help="create sample DNS and mirror config files")
+    pi.add_argument("--dns-file", default="DNSs.txt", help="output DNS file path")
+    pi.add_argument(
+        "--mirrors-file",
+        default="mirrors_list.yaml",
+        help="output mirrors YAML path",
+    )
+    pi.add_argument("--force", action="store_true", help="overwrite existing files")
+    pi.set_defaults(func=cmd_init)
 
     # dns
     pd = sub.add_parser("dns", help="check DNS servers + pick best")
@@ -1283,6 +1815,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="print config snippets too (same as --best)",
     )
     pd.add_argument("--json", action="store_true", help="print full JSON results")
+    pd.add_argument(
+        "--export-resolvconf",
+        default="",
+        help="write resolv.conf snippet to file using best DNS",
+    )
+    pd.add_argument(
+        "--export-hosts",
+        default="",
+        help="write hosts entry for best DNS to file",
+    )
     pd.set_defaults(func=cmd_dns)
 
     pl = sub.add_parser("dns-live", help="live DNS table (curses)")
@@ -1307,7 +1849,12 @@ def build_parser() -> argparse.ArgumentParser:
     pm.add_argument(
         "--kinds",
         default="",
-        help="comma list filter: ubuntu,debian,rhel,pypi,npm,docker",
+        help="comma list filter: ubuntu,debian,rhel,pypi,npm,docker,maven,gradle,go,nuget,composer",
+    )
+    pm.add_argument(
+        "--suite",
+        default="",
+        help="prefer this Ubuntu/Debian suite (defaults to local OS if detected)",
     )
     pm.add_argument("--limit", type=int, default=80, help="print N rows")
     pm.add_argument(
@@ -1319,6 +1866,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="print config snippets too (same as --best)",
     )
     pm.add_argument("--json", action="store_true", help="print full JSON results")
+    pm.add_argument(
+        "--export-hosts",
+        default="",
+        help="write hosts template for best mirrors to file",
+    )
     pm.set_defaults(func=cmd_mirrors)
 
     # docker
@@ -1353,6 +1905,9 @@ def build_parser() -> argparse.ArgumentParser:
     pt.add_argument("--servers", default="DNSs.txt", help="dns servers file")
     pt.add_argument("--domain", default="google.com", help="dns test domain")
     pt.add_argument("--kinds", default="", help="comma list filter kinds")
+    pt.add_argument(
+        "--interval", type=int, default=30, help="seconds between auto-refresh"
+    )
     pt.set_defaults(func=cmd_tui)
 
     return p
@@ -1361,8 +1916,55 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+    if getattr(args, "quick", False):
+        args.timeout = min(args.timeout, 2.5)
+        args.retries = 1
+        args.jobs = min(args.jobs, 16)
+    if getattr(args, "deep", False):
+        args.timeout = max(args.timeout, 10.0)
+        args.retries = max(args.retries, 3)
     return int(args.func(args))
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+def cmd_init(args: argparse.Namespace) -> int:
+    dns_path = args.dns_file
+    mirrors_path = args.mirrors_file
+
+    if (not args.force) and (os.path.exists(dns_path) or os.path.exists(mirrors_path)):
+        print("Refusing to overwrite existing files. Use --force to overwrite.")
+        return 2
+
+    dns_sample = """# One IP per line
+1.1.1.1
+8.8.8.8
+9.9.9.9
+"""
+
+    mirrors_sample = """mirrors:
+  - name: Example PyPI
+    url: https://mirror-pypi.runflare.com/
+    packages:
+      - PyPI
+
+  - name: Example Docker
+    url: https://hub.hamdocker.ir/
+    packages:
+      - Docker Registry
+
+  - name: Example Ubuntu
+    url: https://mirror.arvancloud.ir/
+    packages:
+      - Ubuntu
+"""
+
+    with open(dns_path, "w", encoding="utf-8") as f:
+        f.write(dns_sample.strip() + "\n")
+    with open(mirrors_path, "w", encoding="utf-8") as f:
+        f.write(mirrors_sample.strip() + "\n")
+
+    print(f"Wrote {dns_path} and {mirrors_path}")
+    return 0
