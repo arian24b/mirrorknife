@@ -29,13 +29,11 @@ import ssl
 import struct
 import subprocess
 import time
-from dataclasses import dataclass, asdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List, Optional, Tuple
-from urllib.parse import urlparse, urlencode
-import urllib.request
 import urllib.error
-
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict, dataclass
+from urllib.parse import urlencode, urlparse
 
 DEFAULT_TIMEOUT = 6.0
 DEFAULT_JOBS = 32
@@ -52,7 +50,7 @@ class Target:
     kind: str  # dns | docker | pypi | npm | ubuntu | debian | rhel
     name: str  # display name (mirror name or dns ip)
     base: str  # base URL (mirrors) or IP (dns)
-    meta: Dict[str, str]  # extra knobs (dns domain, etc.)
+    meta: dict[str, str]  # extra knobs (dns domain, etc.)
 
 
 @dataclass
@@ -61,11 +59,11 @@ class Result:
     name: str
     base: str
     ok: bool
-    status: Optional[int]  # HTTP status (mirrors) or DNS rcode (dns)
+    status: int | None  # HTTP status (mirrors) or DNS rcode (dns)
     note: str
     probe: str  # URL or "dns"
-    timings_ms: Dict[str, Optional[int]]
-    stats_ms: Dict[str, Optional[int]]
+    timings_ms: dict[str, int | None]
+    stats_ms: dict[str, int | None]
 
 
 # ------------------ Small utils ------------------
@@ -75,7 +73,7 @@ def ms_now() -> int:
     return int(time.perf_counter() * 1000)
 
 
-def percentile_ms(vals: List[int], p: float) -> Optional[int]:
+def percentile_ms(vals: list[int], p: float) -> int | None:
     if not vals:
         return None
     if p <= 0:
@@ -108,7 +106,7 @@ def join_url(base: str, path: str) -> str:
     return base + path
 
 
-def ping_avg_ms(host: str, count: int = 2) -> Optional[int]:
+def ping_avg_ms(host: str, count: int = 2) -> int | None:
     """
     Uses system ping because raw ICMP requires privileges.
     macOS: ping -c 2 -W 1000 host    (W in ms)
@@ -135,9 +133,9 @@ def ping_avg_ms(host: str, count: int = 2) -> Optional[int]:
         return None
 
 
-def load_lines(path: str) -> List[str]:
-    out: List[str] = []
-    with open(path, "r", encoding="utf-8") as f:
+def load_lines(path: str) -> list[str]:
+    out: list[str] = []
+    with open(path, encoding="utf-8") as f:
         for line in f:
             s = line.strip()
             if not s or s.startswith("#"):
@@ -146,15 +144,15 @@ def load_lines(path: str) -> List[str]:
     return out
 
 
-def detect_suite() -> Optional[str]:
+def detect_suite() -> str | None:
     if not platform.system().lower().startswith("linux"):
         return None
     try:
-        with open("/etc/os-release", "r", encoding="utf-8") as f:
+        with open("/etc/os-release", encoding="utf-8") as f:
             data = f.read().splitlines()
     except Exception:
         return None
-    vals: Dict[str, str] = {}
+    vals: dict[str, str] = {}
     for line in data:
         if not line or "=" not in line:
             continue
@@ -195,7 +193,7 @@ def safe_hline(win, y: int, x: int, ch: int, n: int) -> None:
 # ------------------ YAML-lite parser (mirrors_list.yaml) ------------------
 
 
-def parse_mirrors_yaml_lite(path: str) -> List[dict]:
+def parse_mirrors_yaml_lite(path: str) -> list[dict]:
     """
     Supports a subset of YAML that matches your pasted format:
 
@@ -209,14 +207,13 @@ def parse_mirrors_yaml_lite(path: str) -> List[dict]:
           - PyPI
           - npm
     """
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         lines = f.readlines()
 
-    mirrors: List[dict] = []
-    cur: Optional[dict] = None
+    mirrors: list[dict] = []
+    cur: dict | None = None
     in_packages = False
     packages_indent = 0
-    item_indent = 0
 
     for raw in lines:
         raw2 = raw.rstrip("\n")
@@ -248,7 +245,6 @@ def parse_mirrors_yaml_lite(path: str) -> List[dict]:
                 "geo": "",
             }
             in_packages = False
-            item_indent = indent
             continue
 
         if cur is None:
@@ -264,7 +260,7 @@ def parse_mirrors_yaml_lite(path: str) -> List[dict]:
             cur["url"] = m.group(1).strip().strip('"').strip("'")
             continue
 
-        m = re.match(r"^(geo|region|country)\s*:\s*(.+)\s*$", s, re.I)
+        m = re.match(r"^(geo|region|country)\s*:\s*(.+)\s*$", s, re.IGNORECASE)
         if m:
             cur["geo"] = m.group(2).strip().strip('"').strip("'")
             continue
@@ -277,7 +273,7 @@ def parse_mirrors_yaml_lite(path: str) -> List[dict]:
     if cur:
         mirrors.append(cur)
 
-    cleaned: List[dict] = []
+    cleaned: list[dict] = []
     for m in mirrors:
         url = normalize_url(m.get("url", ""))
         if not url:
@@ -294,11 +290,11 @@ def parse_mirrors_yaml_lite(path: str) -> List[dict]:
     return cleaned
 
 
-def targets_from_mirror_yaml(path: str) -> List[Target]:
+def targets_from_mirror_yaml(path: str) -> list[Target]:
     mirrors = parse_mirrors_yaml_lite(path)
-    out: List[Target] = []
+    out: list[Target] = []
 
-    def has(pkg: str, pkgs: List[str]) -> bool:
+    def has(pkg: str, pkgs: list[str]) -> bool:
         return any(p.lower() == pkg.lower() for p in pkgs)
 
     for m in mirrors:
@@ -361,7 +357,7 @@ def dns_build_query_a(domain: str, qid: int) -> bytes:
     return header + qname + struct.pack("!HH", qtype, qclass)
 
 
-def dns_parse_rcode_and_answers(msg: bytes) -> Tuple[int, int]:
+def dns_parse_rcode_and_answers(msg: bytes) -> tuple[int, int]:
     if len(msg) < 12:
         return (99, 0)
     _id, flags, qd, an, ns, ar = struct.unpack("!HHHHHH", msg[:12])
@@ -371,7 +367,7 @@ def dns_parse_rcode_and_answers(msg: bytes) -> Tuple[int, int]:
 
 def dns_udp_query(
     server_ip: str, domain: str, timeout: float
-) -> Tuple[Optional[int], Optional[int], str]:
+) -> tuple[int | None, int | None, str]:
     qid = random.randint(0, 65535)
     q = dns_build_query_a(domain, qid)
 
@@ -384,7 +380,7 @@ def dns_udp_query(
         if rcode == 0 and an > 0:
             return rcode, an, "OK"
         return rcode, an, f"rcode={rcode} answers={an}"
-    except socket.timeout:
+    except TimeoutError:
         return None, None, "UDP timeout"
     except Exception as e:
         return None, None, f"UDP error: {e}"
@@ -395,7 +391,7 @@ def dns_udp_query(
             pass
 
 
-def dns_tcp_connect_ms(server_ip: str, timeout: float) -> Optional[int]:
+def dns_tcp_connect_ms(server_ip: str, timeout: float) -> int | None:
     t0 = ms_now()
     try:
         s = socket.create_connection((server_ip, 53), timeout=timeout)
@@ -407,7 +403,7 @@ def dns_tcp_connect_ms(server_ip: str, timeout: float) -> Optional[int]:
 
 def dns_tcp_query(
     server_ip: str, domain: str, timeout: float
-) -> Tuple[Optional[int], Optional[int], str]:
+) -> tuple[int | None, int | None, str]:
     qid = random.randint(0, 65535)
     q = dns_build_query_a(domain, qid)
     payload = struct.pack("!H", len(q)) + q  # TCP DNS length prefix
@@ -437,14 +433,14 @@ def dns_tcp_query(
         if rcode == 0 and an > 0:
             return rcode, an, "OK"
         return rcode, an, f"rcode={rcode} answers={an}"
-    except socket.timeout:
+    except TimeoutError:
         return None, None, "TCP timeout"
     except Exception as e:
         return None, None, f"TCP error: {e}"
 
 
 def dns_probe(ip: str, domain: str, timeout: float) -> Result:
-    timings: Dict[str, Optional[int]] = {
+    timings: dict[str, int | None] = {
         "udp_dns_ms": None,
         "tcp_53_ms": None,
         "tcp_dns_ms": None,
@@ -478,7 +474,7 @@ def dns_probe(ip: str, domain: str, timeout: float) -> Result:
 
 def http_timed_get(
     url: str, timeout: float, insecure: bool
-) -> Tuple[Optional[int], Dict[str, Optional[int]], str, Dict[str, str]]:
+) -> tuple[int | None, dict[str, int | None], str, dict[str, str]]:
     """
     Split timings:
       dns_ms: getaddrinfo()
@@ -498,14 +494,14 @@ def http_timed_get(
     if parsed.query:
         path += "?" + parsed.query
 
-    timings: Dict[str, Optional[int]] = {
+    timings: dict[str, int | None] = {
         "dns_ms": None,
         "tcp_ms": None,
         "tls_ms": None,
         "ttfb_ms": None,
         "total_ms": None,
     }
-    headers_out: Dict[str, str] = {}
+    headers_out: dict[str, str] = {}
 
     t_total0 = ms_now()
 
@@ -581,7 +577,7 @@ def http_timed_get(
                 break
             data += chunk
         sock.close()
-    except socket.timeout:
+    except TimeoutError:
         try:
             sock.close()
         except Exception:
@@ -631,7 +627,7 @@ def http_timed_get(
 
 def docker_probe(
     base: str, timeout: float, insecure: bool
-) -> Tuple[bool, Optional[int], Dict[str, Optional[int]], str, str]:
+) -> tuple[bool, int | None, dict[str, int | None], str, str]:
     url = join_url(base, "v2/")
     st, tm, note, hdr = http_timed_get(url, timeout, insecure)
     # Healthy if 200 or 401 (auth challenge is normal)
@@ -646,7 +642,7 @@ def docker_probe(
 
 def pypi_probe(
     base: str, timeout: float, insecure: bool
-) -> Tuple[bool, Optional[int], Dict[str, Optional[int]], str, str]:
+) -> tuple[bool, int | None, dict[str, int | None], str, str]:
     url = join_url(base, "simple/")
     st, tm, note, hdr = http_timed_get(url, timeout, insecure)
     ok = st == 200
@@ -659,7 +655,7 @@ def pypi_probe(
 
 def npm_probe(
     base: str, timeout: float, insecure: bool
-) -> Tuple[bool, Optional[int], Dict[str, Optional[int]], str, str]:
+) -> tuple[bool, int | None, dict[str, int | None], str, str]:
     # npm ping often hits /-/ping or /~/ping depending on registry implementation
     candidates = ["-/ping", "~/ping", ""]
     last = (False, None, {}, "No candidates worked", base)
@@ -677,8 +673,8 @@ def apt_probe(
     kind: str,
     timeout: float,
     insecure: bool,
-    preferred_suites: Optional[List[str]] = None,
-) -> Tuple[bool, Optional[int], Dict[str, Optional[int]], str, str, str]:
+    preferred_suites: list[str] | None = None,
+) -> tuple[bool, int | None, dict[str, int | None], str, str, str]:
     suites = UBUNTU_SUITES if kind == "ubuntu" else DEBIAN_SUITES
     if preferred_suites:
         suites = [s for s in preferred_suites if s] + [
@@ -718,7 +714,7 @@ def apt_probe(
 
 def rhel_probe(
     base: str, timeout: float, insecure: bool
-) -> Tuple[bool, Optional[int], Dict[str, Optional[int]], str, str, str]:
+) -> tuple[bool, int | None, dict[str, int | None], str, str, str]:
     roots = ["", "centos/", "rocky/", "almalinux/"]
     candidates = [
         "repodata/repomd.xml",
@@ -744,7 +740,7 @@ def rhel_probe(
 
 def maven_like_probe(
     base: str, timeout: float, insecure: bool
-) -> Tuple[bool, Optional[int], Dict[str, Optional[int]], str, str]:
+) -> tuple[bool, int | None, dict[str, int | None], str, str]:
     candidates = ["maven2/", "repo/", "repository/", ""]
     last = (False, None, {}, "No candidates", base)
     for c in candidates:
@@ -758,7 +754,7 @@ def maven_like_probe(
 
 def go_proxy_probe(
     base: str, timeout: float, insecure: bool
-) -> Tuple[bool, Optional[int], Dict[str, Optional[int]], str, str]:
+) -> tuple[bool, int | None, dict[str, int | None], str, str]:
     candidates = [
         "github.com/golang/net/@v/list",
         "golang.org/x/text/@v/list",
@@ -775,7 +771,7 @@ def go_proxy_probe(
 
 def nuget_probe(
     base: str, timeout: float, insecure: bool
-) -> Tuple[bool, Optional[int], Dict[str, Optional[int]], str, str]:
+) -> tuple[bool, int | None, dict[str, int | None], str, str]:
     url = join_url(base, "v3/index.json")
     st, tm, note, hdr = http_timed_get(url, timeout, insecure)
     ok = st == 200
@@ -788,7 +784,7 @@ def nuget_probe(
 
 def composer_probe(
     base: str, timeout: float, insecure: bool
-) -> Tuple[bool, Optional[int], Dict[str, Optional[int]], str, str]:
+) -> tuple[bool, int | None, dict[str, int | None], str, str]:
     url = join_url(base, "packages.json")
     st, tm, note, hdr = http_timed_get(url, timeout, insecure)
     ok = st == 200
@@ -804,7 +800,7 @@ def composer_probe(
 
 def _urllib_json_get(
     url: str, timeout: float, insecure: bool
-) -> Tuple[Optional[int], Optional[dict], str]:
+) -> tuple[int | None, dict | None, str]:
     ctx = None
     if insecure and url.startswith("https://"):
         ctx = ssl.create_default_context()
@@ -826,7 +822,7 @@ def _urllib_json_get(
 
 def docker_catalog(
     base: str, timeout: float, insecure: bool, n: int
-) -> Tuple[List[str], str]:
+) -> tuple[list[str], str]:
     url = join_url(base, "v2/_catalog?" + urlencode({"n": str(n)}))
     code, data, note = _urllib_json_get(url, timeout, insecure)
     if code != 200 or not isinstance(data, dict):
@@ -839,7 +835,7 @@ def docker_catalog(
 
 def docker_tags(
     base: str, repo: str, timeout: float, insecure: bool
-) -> Tuple[List[str], str]:
+) -> tuple[list[str], str]:
     url = join_url(base, f"v2/{repo}/tags/list")
     code, data, note = _urllib_json_get(url, timeout, insecure)
     if code != 200 or not isinstance(data, dict):
@@ -942,9 +938,9 @@ def probe_with_retries(
     t: Target, retries: int, timeout: float, insecure: bool
 ) -> Result:
     attempts = max(1, int(retries))
-    best: Optional[Result] = None
+    best: Result | None = None
     best_lat = 10**9
-    ok_latencies: List[int] = []
+    ok_latencies: list[int] = []
 
     for _ in range(attempts):
         r = probe_one(t, timeout, insecure)
@@ -975,14 +971,14 @@ def probe_with_retries(
 
 
 def run_checks(
-    targets: List[Target],
+    targets: list[Target],
     jobs: int,
     timeout: float,
     insecure: bool,
     retries: int,
     prefer_geo: str = "",
-) -> List[Result]:
-    out: List[Result] = []
+) -> list[Result]:
+    out: list[Result] = []
     with ThreadPoolExecutor(max_workers=jobs) as ex:
         futs = [
             ex.submit(probe_with_retries, t, retries, timeout, insecure)
@@ -1011,7 +1007,7 @@ def run_checks(
     return out
 
 
-def pick_best(results: List[Result], kind: str) -> Optional[Result]:
+def pick_best(results: list[Result], kind: str) -> Result | None:
     cands = [r for r in results if r.kind == kind and r.ok]
     if not cands:
         return None
@@ -1026,7 +1022,7 @@ def pick_best(results: List[Result], kind: str) -> Optional[Result]:
 
 
 def print_table(
-    results: List[Result], kinds: Optional[List[str]] = None, limit: int = 50
+    results: list[Result], kinds: list[str] | None = None, limit: int = 50
 ) -> None:
     rows = results
     if kinds:
@@ -1043,7 +1039,7 @@ def print_table(
         print(f"{ok:<3} {r.kind:<7} {lat_txt:>7}  {name:<24}  {r.base}")
 
 
-def write_results_output(results: List[Result], path: str, fmt: str) -> None:
+def write_results_output(results: list[Result], path: str, fmt: str) -> None:
     if not path:
         return
     fmt = (fmt or "json").lower()
@@ -1090,7 +1086,7 @@ def write_results_output(results: List[Result], path: str, fmt: str) -> None:
             f.write(sep.join(row) + "\n")
 
 
-def print_best_snippets(results: List[Result], dns_domain: str) -> None:
+def print_best_snippets(results: list[Result], dns_domain: str) -> None:
     best_dns = pick_best(results, "dns")
     best_ubuntu = pick_best(results, "ubuntu")
     best_debian = pick_best(results, "debian")
@@ -1121,7 +1117,7 @@ def print_best_snippets(results: List[Result], dns_domain: str) -> None:
     else:
         print(f"DNS best for {dns_domain}: (none healthy)")
 
-    def show(kind: str, r: Optional[Result]):
+    def show(kind: str, r: Result | None):
         if r:
             print(
                 f"{kind:>6}: {r.name}  base={r.base}  total={r.timings_ms.get('total_ms')}ms"
@@ -1352,7 +1348,7 @@ def cmd_docker(args: argparse.Namespace) -> int:
 
 
 def cmd_tui(args: argparse.Namespace) -> int:
-    targets: List[Target] = []
+    targets: list[Target] = []
     if args.config:
         targets += targets_from_mirror_yaml(args.config)
     if args.servers:
@@ -1399,11 +1395,11 @@ def cmd_dns_live(args: argparse.Namespace) -> int:
         stdscr.keypad(True)
         stdscr.timeout(150)
 
-        results_map: Dict[str, Result] = {}
+        results_map: dict[str, Result] = {}
         last_run = 0.0
         running = False
 
-        ex: Optional[ThreadPoolExecutor] = None
+        ex: ThreadPoolExecutor | None = None
         futures = {}
         try:
             while True:
@@ -1413,7 +1409,7 @@ def cmd_dns_live(args: argparse.Namespace) -> int:
                 if (not running) and (now - last_run >= interval):
                     running = True
                     last_run = now
-                    empty_timings: Dict[str, Optional[int]] = {
+                    empty_timings: dict[str, int | None] = {
                         "udp_dns_ms": None,
                         "tcp_53_ms": None,
                         "tcp_dns_ms": None,
@@ -1458,7 +1454,7 @@ def cmd_dns_live(args: argparse.Namespace) -> int:
                             try:
                                 results_map[name] = f.result()
                             except Exception as e:
-                                empty_timings_err: Dict[str, Optional[int]] = {
+                                empty_timings_err: dict[str, int | None] = {
                                     "udp_dns_ms": None,
                                     "tcp_53_ms": None,
                                     "tcp_dns_ms": None,
@@ -1515,7 +1511,7 @@ def cmd_dns_live(args: argparse.Namespace) -> int:
                     ping = r.timings_ms.get("ping_ms")
                     note = r.note
 
-                    line = f"{ok}  {r.name:<15} {str(udp or '--'):>7} {str(tcp53 or '--'):>8} {str(tcpdns or '--'):>9} {str(ping or '--'):>8}  {note}"
+                    line = f"{ok}  {r.name:<15} {udp or '--'!s:>7} {tcp53 or '--'!s:>8} {tcpdns or '--'!s:>9} {ping or '--'!s:>8}  {note}"
                     safe_addnstr(stdscr, 3 + i, 0, line, w - 1)
 
                 stdscr.refresh()
@@ -1537,7 +1533,7 @@ def cmd_dns_live(args: argparse.Namespace) -> int:
 
 def _tui_main(
     stdscr,
-    targets: List[Target],
+    targets: list[Target],
     jobs: int,
     timeout: float,
     insecure: bool,
@@ -1557,7 +1553,7 @@ def _tui_main(
     live_refresh = interval > 0
     next_run = time.time() + interval if live_refresh else 0.0
 
-    def filtered() -> List[Result]:
+    def filtered() -> list[Result]:
         if not filter_txt:
             return results
         ft = filter_txt.lower()
@@ -1913,23 +1909,6 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def main() -> int:
-    parser = build_parser()
-    args = parser.parse_args()
-    if getattr(args, "quick", False):
-        args.timeout = min(args.timeout, 2.5)
-        args.retries = 1
-        args.jobs = min(args.jobs, 16)
-    if getattr(args, "deep", False):
-        args.timeout = max(args.timeout, 10.0)
-        args.retries = max(args.retries, 3)
-    return int(args.func(args))
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
-
-
 def cmd_init(args: argparse.Namespace) -> int:
     dns_path = args.dns_file
     mirrors_path = args.mirrors_file
@@ -1968,3 +1947,20 @@ def cmd_init(args: argparse.Namespace) -> int:
 
     print(f"Wrote {dns_path} and {mirrors_path}")
     return 0
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    if getattr(args, "quick", False):
+        args.timeout = min(args.timeout, 2.5)
+        args.retries = 1
+        args.jobs = min(args.jobs, 16)
+    if getattr(args, "deep", False):
+        args.timeout = max(args.timeout, 10.0)
+        args.retries = max(args.retries, 3)
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
